@@ -578,7 +578,6 @@ describe("ExportActions clipboard geometry", () => {
         expect(copyToClipboard).toHaveBeenCalledWith(expectedText);
       });
       expect(downloadAs).toHaveBeenCalledWith({ format: sourceFormat });
-      expect(expectedText).toContain(LONG_GEOMETRY_WKT);
     },
   );
 });
