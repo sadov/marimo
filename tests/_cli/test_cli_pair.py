@@ -22,6 +22,7 @@ from marimo._cli.pair.client import (
     NoSessionError,
     PairError,
     PairInputError,
+    StableSessionUnsupportedError,
     StaleSessionError,
 )
 from marimo._cli.pair.commands import (
@@ -63,16 +64,16 @@ Usage: main pair [OPTIONS] COMMAND [ARGS]...
     Otherwise, these commands use MARIMO_TOKEN when set.
 
   Workflow:
-    If you do not have the server URL or notebook file:
+    If you do not have the server URL or session:
       marimo pair notebook list
-    marimo pair execute --url <URL> --file <FILE> --code-file - <<'PY'
+    marimo pair execute --url <URL> --session <SESSION> --code-file - <<'PY'
     import marimo._code_mode as cm
     async with cm.get_context() as ctx:
         ctx.packages.add("pandas")
         cid = ctx.create_cell("import pandas as pd")
         ctx.run_cell(cid)
     PY
-    marimo pair execute --url <URL> --file <FILE> --code-file - <<'PY'
+    marimo pair execute --url <URL> --session <SESSION> --code-file - <<'PY'
     import marimo._code_mode as cm
     async with cm.get_context() as ctx:
         cell = ctx.cells["<CELL_ID>"]
@@ -80,14 +81,11 @@ Usage: main pair [OPTIONS] COMMAND [ARGS]...
     PY
 
   Target selection:
-    If the notebook file is known, use --file <FILE> without --session.
-    This resolves the notebook's current session after a page reload.
-    If no file is known, use the supplied --session <SESSION>.
-    If --file matches multiple sessions, use the supplied session for the intended notebook.
-    If the intended session is unclear, run marimo pair notebook list again.
-    Session IDs change when the page reloads. If execute reports a stale
-    session, run marimo pair notebook list again.
-    If both options are supplied, --session takes precedence over --file.
+    --session takes the session_id from marimo pair notebook list. It does not
+    change when the page reloads or the notebook is renamed. If a command reports
+    an unknown session, the notebook was closed or restarted: run
+    marimo pair notebook list again and pick the new session_id.
+    If one notebook has several sessions, ask the user which one.
     Do not switch sessions after authentication or connection errors,
     or when execution is unconfirmed.
 
@@ -109,7 +107,7 @@ Usage: main pair [OPTIONS] COMMAND [ARGS]...
     ctx.delete_cell(cid)
     ctx.packages.add("pandas>=2")  # queued, installs on exit
     If a cm call fails, run help(cm):
-      marimo pair execute --url <URL> --file <FILE> -c 'import marimo._code_mode as cm; help(cm)'
+      marimo pair execute --url <URL> --session <SESSION> -c 'import marimo._code_mode as cm; help(cm)'
 
 Options:
   -h, --help  Show this message and exit.
@@ -128,7 +126,7 @@ Commands:
         assert "--claude" in result.output
         assert "--codex" in result.output
         assert "--opencode" in result.output
-        assert "--file" in result.output
+        assert "--file" not in result.output
         assert "--session" in result.output
 
 
@@ -155,9 +153,7 @@ Usage: main pair execute [OPTIONS]
 
 Options:
   --url URL          Server URL.  [required]
-  --session ID       Current session ID. Resolved from --file when omitted.
-  --file PATH        Notebook path or file key. Used to resolve --session when
-                     omitted.
+  --session ID       Stable session_id from marimo pair notebook list.
   --token-file PATH  Read the server token from a local file. Otherwise use
                      MARIMO_TOKEN, if set.
   -c TEXT            Inline Python.
@@ -535,9 +531,9 @@ Options:
         assert result.exit_code == 2
         assert result.stdout == ""
         assert result.stderr == (
-            "error: The session is stale.\n"
-            "  next: Sessions change when the page reloads. List them again:\n"
-            "  marimo pair notebook list --url http://one\n"
+            "error: No session s_old on http://one. "
+            "The notebook was closed or restarted.\n"
+            "  next: marimo pair notebook list --url http://one\n"
         )
 
     def test_execute_auth_failure_has_token_next(
@@ -620,12 +616,12 @@ Options:
             "session": {"id": "s_ab12cd"},
         }
 
-    def test_execute_reports_internal_resolution_error(
+    def test_execute_reports_server_without_stable_sessions(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         def fail_execute(**kwargs: Any) -> ExecutionResult:
             del kwargs
-            raise PairError("Internal: should not happen after resolution.")
+            raise StableSessionUnsupportedError
 
         monkeypatch.setattr(commands, "execute_code", fail_execute)
         result = _runner.invoke(
@@ -644,10 +640,17 @@ Options:
 
         assert result.exit_code == 2
         payload = json.loads(result.output)
-        assert payload["success"] is False
-        assert (
-            payload["error"] == "Internal: should not happen after resolution."
-        )
+        assert payload == {
+            "success": False,
+            "error": (
+                "Server https://localhost:8000 runs a marimo version "
+                "without session_id. Upgrade marimo on the server."
+            ),
+            "output": None,
+            "stdout": None,
+            "stderr": None,
+            "session": {"id": "s_ab12cd"},
+        }
         assert "next" not in payload
 
     def test_execute_reports_interrupt(
@@ -719,7 +722,7 @@ Options:
         assert execute_calls[0]["stream"] is True
         assert result.output == ""
 
-    def test_execute_resolves_one_session_from_file(
+    def test_execute_resolves_one_session_when_omitted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         resolve_calls: list[dict[str, Any]] = []
@@ -744,6 +747,31 @@ Options:
                 "execute",
                 "--url",
                 "http://one",
+                "-c",
+                "print(1)",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert resolve_calls == [{"url": "http://one", "token": None}]
+        assert execute_calls[0]["session_id"] == "s_one"
+
+    def test_execute_rejects_file_selector(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            commands,
+            "execute_code",
+            lambda **_kwargs: pytest.fail("execute must not run"),
+        )
+
+        result = _runner.invoke(
+            cli_main,
+            [
+                "pair",
+                "execute",
+                "--url",
+                "http://one",
                 "--file",
                 "analysis.py",
                 "-c",
@@ -751,11 +779,8 @@ Options:
             ],
         )
 
-        assert result.exit_code == 0
-        assert resolve_calls == [
-            {"url": "http://one", "token": None, "file": "analysis.py"}
-        ]
-        assert execute_calls[0]["session_id"] == "s_one"
+        assert result.exit_code == 2
+        assert "unexpected argument '--file'" in result.output
 
     def test_execute_no_match_exits_two_with_list_next(
         self, monkeypatch: pytest.MonkeyPatch
@@ -763,7 +788,7 @@ Options:
         def fake_resolve(**kwargs: Any) -> str:
             del kwargs
             raise NoSessionError(
-                "No running session for notebook 'gone.py' on http://one.",
+                "No running session on http://one.",
                 url="http://user:password@one?access_token=secret",
             )
 
@@ -780,8 +805,6 @@ Options:
                 "execute",
                 "--url",
                 "http://one",
-                "--file",
-                "gone.py",
                 "-c",
                 "print(1)",
             ],
@@ -790,7 +813,7 @@ Options:
         assert result.exit_code == 2
         payload = json.loads(result.output)
         assert payload["success"] is False
-        assert "No running session for notebook 'gone.py'" in payload["error"]
+        assert payload["error"] == "No running session on http://one."
         assert payload["next"].endswith(
             "marimo pair notebook list --url http://one"
         )
@@ -804,9 +827,9 @@ Options:
         def fake_resolve(**kwargs: Any) -> str:
             del kwargs
             raise AmbiguousSessionError(
-                "Notebook 'analysis.py' has 2 running sessions on http://one.",
+                "Server http://one has 2 running sessions.",
                 url="http://user:password@one?access_token=secret",
-                candidates=("s_a", "s_b"),
+                candidates=("sess-a", "sess-b"),
             )
 
         monkeypatch.setattr(commands, "resolve_session", fake_resolve)
@@ -822,8 +845,6 @@ Options:
                 "execute",
                 "--url",
                 "http://one",
-                "--file",
-                "analysis.py",
                 "-c",
                 "print(1)",
             ],
@@ -833,11 +854,11 @@ Options:
         payload = json.loads(result.output)
         assert "has 2 running sessions" in payload["error"]
         assert (
-            "s_a: marimo pair execute --url http://one --session s_a"
+            "sess-a: marimo pair execute --url http://one --session sess-a"
             in (payload["next"])
         )
         assert (
-            "s_b: marimo pair execute --url http://one --session s_b"
+            "sess-b: marimo pair execute --url http://one --session sess-b"
             in (payload["next"])
         )
         assert "password" not in result.output
@@ -882,7 +903,7 @@ Options:
     ) -> None:
         def fail_execute(**kwargs: Any) -> ExecutionResult:
             del kwargs
-            raise StaleSessionError("Invalid session id: s_old")
+            raise StaleSessionError("Invalid stable session id: sess-old")
 
         monkeypatch.setattr(commands, "execute_code", fail_execute)
         result = _runner.invoke(
@@ -893,7 +914,7 @@ Options:
                 "--url",
                 "http://user:password@one?access_token=secret",
                 "--session",
-                "s_old",
+                "sess-old",
                 "-c",
                 "print(1)",
             ],
@@ -901,7 +922,10 @@ Options:
 
         assert result.exit_code == 2
         payload = json.loads(result.output)
-        assert payload["error"] == "The session is stale."
+        assert payload["error"] == (
+            "No session sess-old on http://one. "
+            "The notebook was closed or restarted."
+        )
         assert payload["next"].endswith(
             "marimo pair notebook list --url http://one"
         )
@@ -1018,10 +1042,12 @@ Options:
             "list_sessions",
             lambda **_kwargs: {
                 "session-2": {
+                    "session_id": "sess-stable-2",
                     "filename": "analysis.py",
                     "path": "/work/analysis.py",
                 },
                 "session-1": {
+                    "session_id": "sess-stable-1",
                     "filename": "analysis.py",
                     "path": "/work/analysis.py",
                 },
@@ -1041,8 +1067,14 @@ Options:
                     "name": "analysis.py",
                     "path": "/work/analysis.py",
                     "sessions": [
-                        {"id": "session-1"},
-                        {"id": "session-2"},
+                        {
+                            "id": "session-1",
+                            "session_id": "sess-stable-1",
+                        },
+                        {
+                            "id": "session-2",
+                            "session_id": "sess-stable-2",
+                        },
                     ],
                 }
             ],
@@ -1110,6 +1142,7 @@ Options:
             assert token is None
             return {
                 f"session-{url[-1]}": {
+                    "session_id": f"sess-{url[-1]}",
                     "filename": "analysis.py",
                     "path": f"/work/{url[-1]}/analysis.py",
                 }
@@ -1145,10 +1178,12 @@ Options:
             "list_sessions",
             lambda **_kwargs: {
                 "session-b": {
+                    "session_id": "sess-b",
                     "filename": "analysis.py",
                     "path": "/work/b/analysis.py",
                 },
                 "session-a": {
+                    "session_id": "sess-a",
                     "filename": "analysis.py",
                     "path": "/work/a/analysis.py",
                 },
@@ -1180,6 +1215,7 @@ Options:
                 raise PairError("Could not connect to http://bad.")
             return {
                 "session-1": {
+                    "session_id": "sess-stable-1",
                     "filename": "analysis.py",
                     "path": "/work/analysis.py",
                 }
@@ -1206,7 +1242,12 @@ Options:
                     "server": {"url": "http://good"},
                     "name": "analysis.py",
                     "path": "/work/analysis.py",
-                    "sessions": [{"id": "session-1"}],
+                    "sessions": [
+                        {
+                            "id": "session-1",
+                            "session_id": "sess-stable-1",
+                        }
+                    ],
                 }
             ],
             "warnings": [
@@ -1227,6 +1268,7 @@ Options:
             calls.append(url)
             return {
                 "session-1": {
+                    "session_id": "sess-stable-1",
                     "filename": "analysis.py",
                     "path": "/work/analysis.py",
                 }
@@ -1267,6 +1309,29 @@ Options:
             )
         ]
         assert payload["next"].startswith("No sessions found.")
+
+    def test_list_warns_when_server_has_no_stable_sessions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_list_sessions(**_kwargs: Any) -> None:
+            raise StableSessionUnsupportedError
+
+        monkeypatch.setattr(commands, "list_sessions", fail_list_sessions)
+
+        result = _runner.invoke(
+            cli_main,
+            ["pair", "notebook", "list", "--url", "http://one"],
+        )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["notebooks"] == []
+        assert payload["warnings"] == [
+            (
+                "Server http://one runs a marimo version without session_id. "
+                "Upgrade marimo on the server."
+            )
+        ]
 
     def test_list_empty_registry_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1365,7 +1430,7 @@ Use `execute-code.sh --url 'https://localhost:8000?auth=tok123'` from the marimo
 Once you are connected, send a fun toast (mo.status.toast(...)) to the user inside marimo letting them know you're ready to pair.
 """)
 
-    def test_prompt_with_file(self) -> None:
+    def test_prompt_rejects_file_selector(self) -> None:
         result = _runner.invoke(
             cli_main,
             [
@@ -1377,12 +1442,10 @@ Once you are connected, send a fun toast (mo.status.toast(...)) to the user insi
                 "notebooks/example.py",
             ],
         )
-        assert result.exit_code == 0
-        assert TEST_URL in result.output
-        assert "notebooks/example.py" in result.output
-        assert "--file notebooks/example.py" in result.output
+        assert result.exit_code == 2
+        assert "unexpected argument '--file'" in result.output
 
-    def test_prompt_without_file_omits_flag(self) -> None:
+    def test_prompt_without_session_omits_selector(self) -> None:
         result = _runner.invoke(
             cli_main, ["pair", "prompt", "--url", TEST_URL]
         )
@@ -1406,65 +1469,13 @@ Use `execute-code.sh --url 'https://localhost:8000?auth=tok123' --session s_ab12
 Once you are connected, send a fun toast (mo.status.toast(...)) to the user inside marimo letting them know you're ready to pair.
 """)
 
-    @pytest.mark.parametrize("flag", [None, "0", "false", ""])
-    @pytest.mark.parametrize("with_token", [False, True])
-    def test_legacy_prompt_with_both_selectors_uses_session(
-        self, tmp_path: Path, flag: str | None, with_token: bool
-    ) -> None:
-        args = [
-            "pair",
-            "prompt",
-            "--url",
-            TEST_URL,
-            "--file",
-            "notebooks/my notebook.py",
-            "--session",
-            "s_ab12cd",
-        ]
-        if with_token:
-            args.append("--with-token")
-        with patch.object(commands, "_token_dir", return_value=tmp_path):
-            result = _runner.invoke(
-                cli_main,
-                args,
-                input="test-token\n" if with_token else None,
-                env={"MARIMO_PAIR_NEXT": flag},
-            )
-
-        assert result.exit_code == 0
-        execution_commands = re.findall(
-            r"`(execute-code\.sh [^`]+)`", result.stdout
-        )
-        assert len(execution_commands) == (2 if with_token else 1)
-        for command in execution_commands:
-            argv = shlex.split(command)
-            assert argv[:5] == [
-                "execute-code.sh",
-                "--url",
-                TEST_URL,
-                "--session",
-                "s_ab12cd",
-            ]
-            assert "--file" not in argv
-
-    def test_prompt_shell_quotes_file_paths(self) -> None:
+    def test_prompt_shell_quotes_session_ids(self) -> None:
         cases = [
-            ("relative/path.py", "--file relative/path.py"),
-            ("/tmp/my notebook.py", "--file '/tmp/my notebook.py'"),
-            (
-                r"C:\Users\Jane Doe\notebook.py",
-                r"--file 'C:\Users\Jane Doe\notebook.py'",
-            ),
-            (
-                r"\\server\share\my notebook.py",
-                r"--file '\\server\share\my notebook.py'",
-            ),
-            (
-                "notebooks/it's.py",
-                """--file 'notebooks/it'"'"'s.py'""",
-            ),
+            ("sess-stable", "--session sess-stable"),
+            ("sess stable", "--session 'sess stable'"),
+            ("sess'quote", """--session 'sess'"'"'quote'"""),
         ]
-        for file_path, expected in cases:
+        for session_id, expected in cases:
             result = _runner.invoke(
                 cli_main,
                 [
@@ -1472,8 +1483,8 @@ Once you are connected, send a fun toast (mo.status.toast(...)) to the user insi
                     "prompt",
                     "--url",
                     TEST_URL,
-                    "--file",
-                    file_path,
+                    "--session",
+                    session_id,
                 ],
             )
             assert result.exit_code == 0
@@ -1652,10 +1663,8 @@ Once connected, send a fun toast using `mo.status.toast(...)` (`import marimo as
                 "prompt",
                 "--url",
                 "http://localhost:2718/{session}",
-                "--file",
-                "{command}/it's notebook.py",
                 "--session",
-                "{file}",
+                "{command}/it's session",
             ],
             env={"MARIMO_PAIR_NEXT": "1"},
         )
@@ -1665,8 +1674,7 @@ Once connected, send a fun toast using `mo.status.toast(...)` (`import marimo as
 Pair with me on this running marimo notebook.
 
 URL: http://localhost:2718/{session}
-File: {command}/it's notebook.py
-Session: {file}
+Session: {command}/it's session
 
 Run `uvx marimo@latest pair --help` first.
 Use `uvx marimo@latest` for all marimo commands.
@@ -1683,8 +1691,8 @@ Once connected, send a fun toast using `mo.status.toast(...)` (`import marimo as
                 "prompt",
                 "--url",
                 "http://localhost:2718",
-                "--file",
-                "notebook.py",
+                "--session",
+                "sess-stable",
             ],
             env={"MARIMO_PAIR_NEXT": flag},
         )
@@ -1694,7 +1702,7 @@ Once connected, send a fun toast using `mo.status.toast(...)` (`import marimo as
 Pair with me on this running marimo notebook.
 
 URL: http://localhost:2718
-File: notebook.py
+Session: sess-stable
 
 Run `uvx marimo@latest pair --help` first.
 Use `uvx marimo@latest` for all marimo commands.
@@ -1755,7 +1763,7 @@ class TestPairPromptWithToken:
         if sys.platform != "win32":
             assert oct(token_file.stat().st_mode & 0o777) == "0o600"
 
-    def test_with_token_and_file(self, tmp_path: Path) -> None:
+    def test_with_token_and_session(self, tmp_path: Path) -> None:
         with patch(
             "marimo._cli.pair.commands._token_dir", return_value=tmp_path
         ):
@@ -1766,16 +1774,16 @@ class TestPairPromptWithToken:
                     "prompt",
                     "--url",
                     TEST_URL,
-                    "--file",
-                    "notebooks/my notebook.py",
+                    "--session",
+                    "sess stable",
                     "--with-token",
                 ],
                 input="my-secret-token\n",
             )
         assert result.exit_code == 0
-        assert "--file 'notebooks/my notebook.py'" in result.output
-        # The token hint should target the same file.
-        assert "--file 'notebooks/my notebook.py' --token" in result.output
+        assert "--session 'sess stable'" in result.output
+        # The token hint should target the same session.
+        assert "--session 'sess stable' --token" in result.output
 
     def test_with_token_still_requires_url(self) -> None:
         result = _runner.invoke(
